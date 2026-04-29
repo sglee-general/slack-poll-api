@@ -1,24 +1,22 @@
 const { App, ExpressReceiver } = require('@slack/bolt');
 const Redis = require('ioredis');
 
-// 1. Redis 연결 설정을 변수로 관리 (타임아웃 방지 설정 추가)
-let redis;
+// 1. Redis 설정 (전역 변수로 선언하여 연결 재사용)
+let redisCache;
 function getRedis() {
-  if (!redis) {
-    redis = new Redis(process.env.REDIS_URL, {
-      connectTimeout: 10000, // 연결 시도 시간을 10초로 늘림
-      maxRetriesPerRequest: 3,
-      retryStrategy(times) {
-        return Math.min(times * 50, 2000);
-      }
+  if (!redisCache) {
+    redisCache = new Redis(process.env.REDIS_URL, {
+      connectTimeout: 5000,
+      maxRetriesPerRequest: 1
     });
   }
-  return redis;
+  return redisCache;
 }
 
+// 2. Receiver 설정
 const receiver = new ExpressReceiver({
   signingSecret: process.env.SLACK_SIGNING_SECRET,
-  processBeforeResponse: true,
+  processBeforeResponse: true, // 서버리스 환경에서 필수
 });
 
 const app = new App({
@@ -26,10 +24,13 @@ const app = new App({
   receiver,
 });
 
-/** [로직 부분] **/
+/** [핵심 로직] **/
 
 app.command('/설문', async ({ ack, body, client }) => {
-  await ack();
+  // ★ 중요: 슬랙에게 즉시 대답 (3초 타임아웃 방지)
+  await ack(); 
+
+  // 나머지 작업은 비동기로 처리
   try {
     const optionBlocks = [1, 2, 3, 4, 5].map(num => ({
       type: 'input',
@@ -49,23 +50,25 @@ app.command('/설문', async ({ ack, body, client }) => {
         type: 'modal',
         callback_id: 'poll_modal',
         private_metadata: body.channel_id,
-        title: { type: 'plain_text', text: '📊 설문조사 생성' },
+        title: { type: 'plain_text', text: '📊 설문조사' },
         blocks: [
           {
             type: 'input',
             block_id: 'topic_block',
             element: { type: 'plain_text_input', action_id: 'topic_input' },
-            label: { type: 'plain_text', text: '설문 주제' }
+            label: { type: 'plain_text', text: '주제' }
           },
-          { type: 'divider' },
           ...optionBlocks
         ],
-        submit: { type: 'plain_text', text: '설문 시작' }
+        submit: { type: 'plain_text', text: '시작' }
       }
     });
-  } catch (e) { console.error("Modal Error:", e); }
+  } catch (error) {
+    console.error("View Open Error:", error);
+  }
 });
 
+// 모달 제출 처리
 app.view('poll_modal', async ({ ack, body, view, client }) => {
   await ack();
   const channelId = view.private_metadata;
@@ -78,65 +81,57 @@ app.view('poll_modal', async ({ ack, body, view, client }) => {
 
   const blocks = [
     { type: 'section', text: { type: 'mrkdwn', text: `🔔 *새로운 설문: ${topic}*` } },
-    { type: 'divider' }
-  ];
-
-  options.forEach((option, index) => {
-    blocks.push({
+    { type: 'divider' },
+    ...options.map((opt, i) => ({
       type: 'section',
-      text: { type: 'mrkdwn', text: `*${option}*` },
-      accessory: {
-        type: 'button',
-        text: { type: 'plain_text', text: '투표' },
-        value: option,
-        action_id: `vote_${index}`
-      }
-    });
-  });
-
-  blocks.push({
-    type: 'actions',
-    elements: [{ type: 'button', text: { type: 'plain_text', text: '결과 보기 및 종료' }, style: 'danger', action_id: 'end_poll' }]
-  });
+      text: { type: 'mrkdwn', text: `*${opt}*` },
+      accessory: { type: 'button', text: { type: 'plain_text', text: '투표' }, value: opt, action_id: `vote_${i}` }
+    })),
+    { type: 'actions', elements: [{ type: 'button', text: { type: 'plain_text', text: '종료' }, style: 'danger', action_id: 'end_poll' }] }
+  ];
 
   await client.chat.postMessage({ channel: channelId, blocks, text: `설문 시작: ${topic}` });
 });
 
-// 투표 저장 로직
+// 투표 저장
 app.action(/^vote_/, async ({ ack, body, action }) => {
   await ack();
-  const r = getRedis();
-  await r.hset(`poll:${body.message.ts}`, body.user.id, action.value);
+  const redis = getRedis();
+  await redis.hset(`poll:${body.message.ts}`, body.user.id, action.value);
 });
 
-// 종료 처리 로직
+// 종료 처리
 app.action('end_poll', async ({ ack, body, client }) => {
   await ack();
-  const r = getRedis();
-  const votes = await r.hgetall(`poll:${body.message.ts}`);
+  const redis = getRedis();
+  const votes = await redis.hgetall(`poll:${body.message.ts}`);
   if (!votes || Object.keys(votes).length === 0) return;
   
   const tally = {};
   Object.values(votes).forEach(c => tally[c] = (tally[c] || 0) + 1);
-  let res = `📊 *설문 종료 결과*\n\n`;
+  let res = `📊 *최종 결과*\n\n`;
   for (const [c, count] of Object.entries(tally)) res += `• *${c}*: ${count}표\n`;
   
   await client.chat.update({ 
-    channel: body.channel.id, 
-    ts: body.message.ts, 
-    blocks: [{ type: 'section', text: { type: 'mrkdwn', text: res } }], 
-    text: "설문 종료" 
+    channel: body.channel.id, ts: body.message.ts, 
+    blocks: [{ type: 'section', text: { type: 'mrkdwn', text: res } }], text: "결과" 
   });
 });
 
-/** 3. Vercel용 메인 핸들러 **/
+// 3. Vercel용 통합 핸들러 (중요: 이 형식을 유지해야 404가 안 납니다)
 module.exports = async (req, res) => {
-  if (req.body && req.body.challenge) return res.status(200).send(req.body.challenge);
-  
   if (req.method === 'POST') {
+    // 슬랙 챌린지 대응
+    if (req.body && req.body.challenge) {
+      return res.status(200).send(req.body.challenge);
+    }
+    // Bolt 앱 핸들러 실행
     return await receiver.requestHandler(req, res);
   }
-  res.status(200).send('API is Online');
+  res.status(404).send('Not Found');
 };
 
-module.exports.config = { api: { bodyParser: false } };
+// Vercel 설정: 바디 파서 비활성화
+module.exports.config = {
+  api: { bodyParser: false },
+};
