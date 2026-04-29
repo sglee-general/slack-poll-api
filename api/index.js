@@ -1,14 +1,15 @@
 const { App } = require('@slack/bolt');
 const { kv } = require('@vercel/kv');
+const qs = require('querystring');
 
-// ✅ Bolt App (receiver 없음)
+// ✅ Bolt App
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
   signingSecret: process.env.SLACK_SIGNING_SECRET,
 });
 
 // -----------------------------
-// 1. 슬래시 명령어
+// 1. /설문 → 모달 열기
 // -----------------------------
 app.command('/설문', async ({ ack, body, client }) => {
   await ack();
@@ -49,15 +50,15 @@ app.command('/설문', async ({ ack, body, client }) => {
       },
     });
   } catch (e) {
-    console.error(e);
+    console.error('Modal Open Error:', e);
   }
 });
 
 // -----------------------------
-// 2. 모달 제출
+// 2. 모달 제출 → 설문 생성
 // -----------------------------
 app.view('poll_modal', async ({ ack, view, client }) => {
-  await ack(); // 🔥 핵심
+  await ack(); // 🔥 가장 중요
 
   try {
     const channelId = view.private_metadata;
@@ -67,7 +68,7 @@ app.view('poll_modal', async ({ ack, view, client }) => {
     for (let i = 1; i <= 5; i++) {
       const val =
         view.state.values[`option_block_${i}`][`option_input_${i}`].value;
-      if (val) options.push(val);
+      if (val && val.trim()) options.push(val.trim());
     }
 
     const blocks = [
@@ -96,22 +97,23 @@ app.view('poll_modal', async ({ ack, view, client }) => {
       elements: [
         {
           type: 'button',
-          text: { type: 'plain_text', text: '종료' },
-          action_id: 'end_poll',
+          text: { type: 'plain_text', text: '결과 보기 및 종료' },
           style: 'danger',
+          action_id: 'end_poll',
         },
       ],
     });
 
-    const res = await client.chat.postMessage({
+    const result = await client.chat.postMessage({
       channel: channelId,
       text: topic,
       blocks,
     });
 
-    await kv.hset(`poll:${res.ts}`, {});
+    // Redis 초기화
+    await kv.hset(`poll:${result.ts}`, {});
   } catch (e) {
-    console.error(e);
+    console.error('Poll Create Error:', e);
   }
 });
 
@@ -126,18 +128,20 @@ app.action(/^vote_/, async ({ ack, body, action }) => {
       [body.user.id]: action.value,
     });
   } catch (e) {
-    console.error(e);
+    console.error('Vote Error:', e);
   }
 });
 
 // -----------------------------
-// 4. 종료
+// 4. 설문 종료
 // -----------------------------
 app.action('end_poll', async ({ ack, body, client }) => {
   await ack();
 
   try {
-    const votes = await kv.hgetall(`poll:${body.message.ts}`);
+    const pollKey = `poll:${body.message.ts}`;
+    const votes = await kv.hgetall(pollKey);
+
     if (!votes) return;
 
     const tally = {};
@@ -145,43 +149,70 @@ app.action('end_poll', async ({ ack, body, client }) => {
       tally[v] = (tally[v] || 0) + 1;
     });
 
-    let text = `📊 *설문 결과*\n\n`;
-    for (const [k, v] of Object.entries(tally)) {
-      text += `• ${k}: ${v}표\n`;
+    let resultText = `📊 *설문 결과*\n\n`;
+
+    for (const [choice, count] of Object.entries(tally)) {
+      resultText += `• *${choice}*: ${count}표\n`;
     }
 
     await client.chat.update({
       channel: body.channel.id,
       ts: body.message.ts,
-      text: '종료',
-      blocks: [{ type: 'section', text: { type: 'mrkdwn', text } }],
+      text: '설문 종료',
+      blocks: [
+        {
+          type: 'section',
+          text: { type: 'mrkdwn', text: resultText },
+        },
+      ],
     });
+
+    await kv.del(pollKey);
   } catch (e) {
-    console.error(e);
+    console.error('End Poll Error:', e);
   }
 });
 
 // -----------------------------
-// 5. Vercel 핸들러
+// 5. Vercel Handler (🔥 핵심)
 // -----------------------------
 module.exports = async (req, res) => {
   if (req.method !== 'POST') {
-    return res.status(200).send('OK');
+    return res.status(200).send('Slack Poll API Running');
   }
 
+  // 🔥 raw body 읽기
+  const buffers = [];
+  for await (const chunk of req) {
+    buffers.push(chunk);
+  }
+  const rawBody = Buffer.concat(buffers).toString();
+
+  let body;
+
   try {
+    if (req.headers['content-type']?.includes('application/x-www-form-urlencoded')) {
+      const parsed = qs.parse(rawBody);
+      body = parsed.payload ? JSON.parse(parsed.payload) : parsed;
+    } else {
+      body = JSON.parse(rawBody);
+    }
+
     await app.processEvent({
-      body: req.body,
+      body,
       headers: req.headers,
     });
 
     res.status(200).end();
   } catch (e) {
-    console.error(e);
+    console.error('Handler Error:', e);
     res.status(500).end();
   }
 };
 
+// -----------------------------
+// 6. 필수 설정
+// -----------------------------
 module.exports.config = {
   api: {
     bodyParser: false,
