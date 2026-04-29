@@ -1,178 +1,166 @@
-const { App, HTTPReceiver } = require('@slack/bolt');
-const { kv } = require('@vercel/kv');
+import crypto from 'crypto';
+import fetch from 'node-fetch';
+import { kv } from '@vercel/kv';
+import qs from 'querystring';
+
+const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
+const SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET;
 
 // -----------------------------
-// 1. Receiver (🔥 핵심)
+// 1. Slack 서명 검증
 // -----------------------------
-const receiver = new HTTPReceiver({
-  signingSecret: process.env.SLACK_SIGNING_SECRET,
-});
+function verifySlackRequest(req, rawBody) {
+  const timestamp = req.headers['x-slack-request-timestamp'];
+  const signature = req.headers['x-slack-signature'];
+
+  const baseString = `v0:${timestamp}:${rawBody}`;
+  const hmac = crypto.createHmac('sha256', SIGNING_SECRET);
+  const hash = 'v0=' + hmac.update(baseString).digest('hex');
+
+  return crypto.timingSafeEqual(Buffer.from(hash), Buffer.from(signature));
+}
 
 // -----------------------------
-// 2. App
+// 2. Slack API 호출 함수
 // -----------------------------
-const app = new App({
-  token: process.env.SLACK_BOT_TOKEN,
-  receiver,
-});
-
-// -----------------------------
-// 3. /설문 → 모달
-// -----------------------------
-app.command('/설문', async ({ ack, body, client }) => {
-  await ack();
-
-  const optionBlocks = [1, 2, 3, 4, 5].map((n) => ({
-    type: 'input',
-    block_id: `opt_${n}`,
-    optional: n > 2,
-    element: {
-      type: 'plain_text_input',
-      action_id: `input_${n}`,
+async function slackAPI(method, body) {
+  return fetch(`https://slack.com/api/${method}`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+      'Content-Type': 'application/json',
     },
-    label: { type: 'plain_text', text: `선택지 ${n}` },
-  }));
-
-  await client.views.open({
-    trigger_id: body.trigger_id,
-    view: {
-      type: 'modal',
-      callback_id: 'poll_modal',
-      private_metadata: body.channel_id,
-      title: { type: 'plain_text', text: '📊 설문 생성' },
-      submit: { type: 'plain_text', text: '설문 시작' },
-      blocks: [
-        {
-          type: 'input',
-          block_id: 'topic',
-          element: {
-            type: 'plain_text_input',
-            action_id: 'topic_input',
-          },
-          label: { type: 'plain_text', text: '설문 주제' },
-        },
-        { type: 'divider' },
-        ...optionBlocks,
-      ],
-    },
+    body: JSON.stringify(body),
   });
-});
+}
 
 // -----------------------------
-// 4. 모달 제출 → 설문 생성
+// 3. 메인 핸들러
 // -----------------------------
-app.view('poll_modal', async ({ ack, view, client }) => {
-  await ack();
-
-  const channelId = view.private_metadata;
-  const topic = view.state.values.topic.topic_input.value;
-
-  const options = [];
-  for (let i = 1; i <= 5; i++) {
-    const val = view.state.values[`opt_${i}`][`input_${i}`].value;
-    if (val && val.trim()) options.push(val.trim());
+export default async function handler(req, res) {
+  if (req.method !== 'POST') {
+    return res.status(200).send('OK');
   }
 
-  const blocks = [
-    {
-      type: 'section',
-      text: { type: 'mrkdwn', text: `📊 *${topic}*` },
-    },
-    { type: 'divider' },
-  ];
+  // raw body 읽기
+  const buffers = [];
+  for await (const chunk of req) buffers.push(chunk);
+  const rawBody = Buffer.concat(buffers).toString();
 
-  options.forEach((opt, i) => {
-    blocks.push({
-      type: 'section',
-      text: { type: 'mrkdwn', text: `*${opt}*` },
-      accessory: {
-        type: 'button',
-        text: { type: 'plain_text', text: '투표' },
-        action_id: `vote_${i}`,
-        value: opt,
+  // 서명 검증
+  if (!verifySlackRequest(req, rawBody)) {
+    return res.status(401).send('Invalid signature');
+  }
+
+  // body 파싱
+  let payload;
+  const parsed = qs.parse(rawBody);
+
+  if (parsed.payload) {
+    payload = JSON.parse(parsed.payload);
+  } else {
+    payload = parsed;
+  }
+
+  // -----------------------------
+  // 4. Slash Command
+  // -----------------------------
+  if (payload.command === '/설문') {
+    res.status(200).end(); // 🔥 즉시 ack
+
+    await slackAPI('views.open', {
+      trigger_id: payload.trigger_id,
+      view: {
+        type: 'modal',
+        callback_id: 'poll_modal',
+        private_metadata: payload.channel_id,
+        title: { type: 'plain_text', text: '📊 설문 생성' },
+        submit: { type: 'plain_text', text: '시작' },
+        blocks: [
+          {
+            type: 'input',
+            block_id: 'topic',
+            element: {
+              type: 'plain_text_input',
+              action_id: 'topic_input',
+            },
+            label: { type: 'plain_text', text: '설문 주제' },
+          },
+        ],
       },
     });
-  });
 
-  blocks.push({
-    type: 'actions',
-    elements: [
-      {
-        type: 'button',
-        text: { type: 'plain_text', text: '결과 보기 및 종료' },
-        style: 'danger',
-        action_id: 'end_poll',
-      },
-    ],
-  });
-
-  const res = await client.chat.postMessage({
-    channel: channelId,
-    text: topic,
-    blocks,
-  });
-
-  await kv.hset(`poll:${res.ts}`, {});
-});
-
-// -----------------------------
-// 5. 투표
-// -----------------------------
-app.action(/^vote_/, async ({ ack, body, action }) => {
-  await ack();
-
-  await kv.hset(`poll:${body.message.ts}`, {
-    [body.user.id]: action.value,
-  });
-});
-
-// -----------------------------
-// 6. 종료
-// -----------------------------
-app.action('end_poll', async ({ ack, body, client }) => {
-  await ack();
-
-  const key = `poll:${body.message.ts}`;
-  const votes = await kv.hgetall(key);
-
-  if (!votes) return;
-
-  const tally = {};
-  Object.values(votes).forEach((v) => {
-    tally[v] = (tally[v] || 0) + 1;
-  });
-
-  let text = `📊 *설문 결과*\n\n`;
-  for (const [k, v] of Object.entries(tally)) {
-    text += `• *${k}*: ${v}표\n`;
+    return;
   }
 
-  await client.chat.update({
-    channel: body.channel.id,
-    ts: body.message.ts,
-    text: '설문 종료',
-    blocks: [
-      {
-        type: 'section',
-        text: { type: 'mrkdwn', text },
+  // -----------------------------
+  // 5. 모달 제출
+  // -----------------------------
+  if (payload.type === 'view_submission') {
+    res.status(200).end(); // 🔥 즉시 ack
+
+    const topic = payload.view.state.values.topic.topic_input.value;
+    const channel = payload.view.private_metadata;
+
+    const result = await fetch('https://slack.com/api/chat.postMessage', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+        'Content-Type': 'application/json',
       },
-    ],
-  });
+      body: JSON.stringify({
+        channel,
+        text: `📊 설문: ${topic}`,
+      }),
+    }).then(r => r.json());
 
-  await kv.del(key);
-});
+    await kv.hset(`poll:${result.ts}`, {});
+    return;
+  }
 
-// -----------------------------
-// 7. Vercel handler
-// -----------------------------
-module.exports = async (req, res) => {
-  return await receiver.requestHandler(req, res);
-};
+  // -----------------------------
+  // 6. 버튼 클릭
+  // -----------------------------
+  if (payload.type === 'block_actions') {
+    res.status(200).end(); // 🔥 즉시 ack
 
-// -----------------------------
-// 8. 필수 설정
-// -----------------------------
-module.exports.config = {
+    const action = payload.actions[0];
+
+    // 투표
+    if (action.action_id.startsWith('vote_')) {
+      await kv.hset(`poll:${payload.message.ts}`, {
+        [payload.user.id]: action.value,
+      });
+    }
+
+    // 종료
+    if (action.action_id === 'end_poll') {
+      const votes = await kv.hgetall(`poll:${payload.message.ts}`);
+      const tally = {};
+
+      Object.values(votes || {}).forEach(v => {
+        tally[v] = (tally[v] || 0) + 1;
+      });
+
+      let text = '📊 설문 결과\n\n';
+      for (const [k, v] of Object.entries(tally)) {
+        text += `• ${k}: ${v}표\n`;
+      }
+
+      await slackAPI('chat.update', {
+        channel: payload.channel.id,
+        ts: payload.message.ts,
+        text,
+      });
+    }
+
+    return;
+  }
+
+  res.status(200).end();
+}
+
+export const config = {
   api: {
     bodyParser: false,
   },
