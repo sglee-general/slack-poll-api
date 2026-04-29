@@ -2,7 +2,6 @@ const { WebClient } = require('@slack/web-api');
 const { Redis } = require('@upstash/redis');
 const querystring = require('querystring');
 
-// 1. 초기화 (라이브러리만 사용하고 Bolt의 복잡한 리시버는 건너뜁니다)
 const client = new WebClient(process.env.SLACK_BOT_TOKEN);
 const redis = new Redis({
   url: process.env.KV_REST_API_URL,
@@ -10,21 +9,30 @@ const redis = new Redis({
 });
 
 module.exports = async (req, res) => {
-  // POST가 아니면 무시
+  // 1. 접속 로그 (Vercel 로그에서 확인 가능)
+  console.log("--- 새로운 요청 발생 ---");
+  console.log("메소드:", req.method);
+
   if (req.method !== 'POST') return res.status(200).send('API Online');
 
-  // Vercel이 파싱한 바디 가져오기
-  const body = req.body;
+  // 2. 데이터 파싱 (Vercel 환경에 맞게 수동 파싱)
+  let body = req.body;
+  if (typeof body === 'string' || Buffer.isBuffer(body)) {
+    body = querystring.parse(body.toString());
+  }
 
-  // [A] 슬랙 챌린지 (최초 연결용)
-  if (body.challenge) return res.status(200).send(body.challenge);
+  // 3. 슬랙 챌린지 대응
+  if (body.challenge) {
+    console.log("Challenge 요청 처리");
+    return res.status(200).send(body.challenge);
+  }
 
-  // [B] 슬래시 명령어 (/설문) 처리
+  // 4. 명령어(/설문) 처리
   if (body.command === '/설문') {
-    res.status(200).send(); // 0.1초 만에 응답해서 타임아웃 방지
+    console.log("명령어 인식됨: /설문");
     
     try {
-      await client.views.open({
+      const result = await client.views.open({
         trigger_id: body.trigger_id,
         view: {
           type: 'modal',
@@ -33,64 +41,44 @@ module.exports = async (req, res) => {
           title: { type: 'plain_text', text: '📊 설문조사' },
           blocks: [
             { type: 'input', block_id: 'topic', element: { type: 'plain_text_input', action_id: 'i' }, label: { type: 'plain_text', text: '주제' } },
-            ...[1, 2, 3, 4, 5].map(n => ({
-              type: 'input', block_id: `b${n}`, optional: n > 2,
-              element: { type: 'plain_text_input', action_id: `i${n}` },
-              label: { type: 'plain_text', text: `선택지 ${n}` }
-            }))
+            { type: 'input', block_id: 'b1', element: { type: 'plain_text_input', action_id: 'i1' }, label: { type: 'plain_text', text: '선택지 1' } },
+            { type: 'input', block_id: 'b2', element: { type: 'plain_text_input', action_id: 'i2' }, label: { type: 'plain_text', text: '선택지 2' } }
           ],
           submit: { type: 'plain_text', text: '시작' }
         }
       });
-    } catch (e) { console.error("Modal Error:", e); }
-    return;
+      console.log("모달 전송 성공");
+      return res.status(200).send(""); // 성공 응답
+    } catch (e) {
+      console.error("모달 전송 실패 에러:", e.data ? JSON.stringify(e.data) : e.message);
+      return res.status(200).send("에러가 발생했습니다: " + e.message);
+    }
   }
 
-  // [C] 인터랙션 (모달 제출, 투표 버튼 등) 처리
+  // 5. 인터랙션 (확인 버튼 등) 처리
   if (body.payload) {
     const payload = JSON.parse(body.payload);
-    
-    // 즉시 응답 (슬랙의 3초 타임아웃을 물리적으로 차단)
-    res.status(200).send();
+    console.log("인터랙션 타입:", payload.type);
 
-    // 1. 모달 제출 (설문 시작)
-    if (payload.type === 'view_submission' && payload.view.callback_id === 'poll_modal') {
+    if (payload.type === 'view_submission') {
       const channelId = payload.view.private_metadata;
-      const values = payload.view.state.values;
-      const topic = values.topic.i.value;
-      const options = [];
-      for (let i = 1; i <= 5; i++) {
-        const val = values[`b${i}`][`i${i}`].value;
-        if (val) options.push(val);
-      }
+      const topic = payload.view.state.values.topic.i.value;
+      const opt1 = payload.view.state.values.b1.i1.value;
+      const opt2 = payload.view.state.values.b2.i2.value;
 
-      const blocks = [
-        { type: 'section', text: { type: 'mrkdwn', text: `🔔 *새 설문: ${topic}*` } },
-        ...options.map((opt, i) => ({
-          type: 'section', text: { type: 'mrkdwn', text: `*${opt}*` },
-          accessory: { type: 'button', text: { type: 'plain_text', text: '투표' }, value: opt, action_id: `v_${i}` }
-        })),
-        { type: 'actions', elements: [{ type: 'button', text: { type: 'plain_text', text: '종료' }, style: 'danger', action_id: 'end' }] }
-      ];
-
-      await client.chat.postMessage({ channel: channelId, blocks, text: topic });
-    }
-
-    // 2. 투표 버튼 클릭
-    if (payload.type === 'block_actions' && payload.actions[0].action_id.startsWith('v_')) {
-      const action = payload.actions[0];
-      await redis.hset(`poll:${payload.message.ts}`, { [payload.user.id]: action.value });
-    }
-
-    // 3. 종료 버튼 클릭
-    if (payload.type === 'block_actions' && payload.actions[0].action_id === 'end') {
-      const votes = await redis.hgetall(`poll:${payload.message.ts}`);
-      if (!votes) return;
-      const tally = {};
-      Object.values(votes).forEach(v => tally[v] = (tally[v] || 0) + 1);
-      let resMsg = `📊 *결과*\n\n`;
-      for (const [o, c] of Object.entries(tally)) resMsg += `• *${o}*: ${c}표\n`;
-      await client.chat.update({ channel: payload.channel.id, ts: payload.message.ts, blocks: [{ type: 'section', text: { type: 'mrkdwn', text: resMsg } }], text: "종료" });
+      await client.chat.postMessage({
+        channel: channelId,
+        text: `📊 *설문 시작: ${topic}*`,
+        blocks: [
+          { type: 'section', text: { type: 'mrkdwn', text: `*${topic}*` } },
+          { type: 'section', text: { type: 'mrkdwn', text: `1️⃣ ${opt1}` }, accessory: { type: 'button', text: { type: 'plain_text', text: '투표' }, value: opt1, action_id: 'v1' } },
+          { type: 'section', text: { type: 'mrkdwn', text: `2️⃣ ${opt2}` }, accessory: { type: 'button', text: { type: 'plain_text', text: '투표' }, value: opt2, action_id: 'v2' } }
+        ]
+      });
+      return res.status(200).send("");
     }
   }
+
+  console.log("처리되지 않은 요청");
+  res.status(200).send("");
 };
