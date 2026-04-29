@@ -1,10 +1,15 @@
 const { App, ExpressReceiver } = require('@slack/bolt');
 const { kv } = require('@vercel/kv');
 
-// 1. Receiver 설정 (Vercel 환경 맞춤)
+// 1. Receiver 설정 - 엔드포인트를 Vercel 경로에 맞게 명시적으로 지정
 const receiver = new ExpressReceiver({
   signingSecret: process.env.SLACK_SIGNING_SECRET,
-  processBeforeResponse: true, // Serverless 환경에서 필수
+  // Vercel의 /api 경로와 일치시킵니다.
+  endpoints: {
+    events: '/api',
+    interactive: '/api',
+  },
+  processBeforeResponse: true,
 });
 
 const app = new App({
@@ -12,7 +17,7 @@ const app = new App({
   receiver,
 });
 
-/** [이하 설문조사 로직 - 이전과 동일하지만 경로 수정을 위해 포함] **/
+/** 2. 로직 부분 (기존과 동일) **/
 
 app.command('/설문', async ({ ack, body, client }) => {
   await ack();
@@ -50,73 +55,91 @@ app.command('/설문', async ({ ack, body, client }) => {
       }
     });
   } catch (error) {
-    console.error(error);
+    console.error("Modal Open Error:", error);
   }
 });
 
 // 설문 시작 버튼(모달 제출) 처리
 app.view('poll_modal', async ({ ack, body, view, client }) => {
   await ack();
-  const channelId = view.private_metadata;
-  const topic = view.state.values.topic_block.topic_input.value;
-  const options = [];
-  for (let i = 1; i <= 5; i++) {
-    const val = view.state.values[`option_block_${i}`][`option_input_${i}`].value;
-    if (val && val.trim() !== '') options.push(val.trim());
-  }
+  try {
+    const channelId = view.private_metadata;
+    const topic = view.state.values.topic_block.topic_input.value;
+    const options = [];
+    for (let i = 1; i <= 5; i++) {
+      const val = view.state.values[`option_block_${i}`][`option_input_${i}`].value;
+      if (val && val.trim() !== '') options.push(val.trim());
+    }
 
-  const blocks = [
-    { type: 'section', text: { type: 'mrkdwn', text: `🔔 *새로운 설문: ${topic}*` } },
-    { type: 'divider' }
-  ];
+    const blocks = [
+      { type: 'section', text: { type: 'mrkdwn', text: `🔔 *새로운 설문: ${topic}*` } },
+      { type: 'divider' }
+    ];
 
-  options.forEach((option, index) => {
-    blocks.push({
-      type: 'section',
-      text: { type: 'mrkdwn', text: `*${option}*` },
-      accessory: {
-        type: 'button',
-        text: { type: 'plain_text', text: '투표' },
-        value: option,
-        action_id: `vote_${index}`
-      }
+    options.forEach((option, index) => {
+      blocks.push({
+        type: 'section',
+        text: { type: 'mrkdwn', text: `*${option}*` },
+        accessory: {
+          type: 'button',
+          text: { type: 'plain_text', text: '투표' },
+          value: option,
+          action_id: `vote_${index}`
+        }
+      });
     });
-  });
 
-  blocks.push({
-    type: 'actions',
-    elements: [{ type: 'button', text: { type: 'plain_text', text: '결과 보기 및 종료' }, style: 'danger', action_id: 'end_poll' }]
-  });
+    blocks.push({
+      type: 'actions',
+      elements: [{ type: 'button', text: { type: 'plain_text', text: '결과 보기 및 종료' }, style: 'danger', action_id: 'end_poll' }]
+    });
 
-  await client.chat.postMessage({ channel: channelId, blocks, text: `설문 시작: ${topic}` });
+    await client.chat.postMessage({ channel: channelId, blocks, text: `설문 시작: ${topic}` });
+  } catch (error) {
+    console.error("Post Message Error:", error);
+  }
 });
 
-// 투표 및 종료 로직 (생략 - 기존 로직 유지)
-app.action(/^vote_/, async ({ ack, body, action }) => { await ack(); await kv.hset(`poll:${body.message.ts}`, { [body.user.id]: action.value }); });
+// 투표 버튼 처리
+app.action(/^vote_/, async ({ ack, body, action }) => {
+  await ack();
+  try {
+    await kv.hset(`poll:${body.message.ts}`, { [body.user.id]: action.value });
+  } catch (e) { console.error("KV Error:", e); }
+});
+
+// 설문 종료 처리
 app.action('end_poll', async ({ ack, body, client }) => {
   await ack();
-  const votes = await kv.hgetall(`poll:${body.message.ts}`);
-  if (!votes) return;
-  const tally = {};
-  Object.values(votes).forEach(c => tally[c] = (tally[c] || 0) + 1);
-  let res = `📊 *결과*\n\n`;
-  for (const [c, count] of Object.entries(tally)) res += `• *${c}*: ${count}표\n`;
-  await client.chat.update({ channel: body.channel.id, ts: body.message.ts, blocks: [{ type: 'section', text: { type: 'mrkdwn', text: res } }], text: "종료" });
+  try {
+    const votes = await kv.hgetall(`poll:${body.message.ts}`);
+    if (!votes) return;
+    const tally = {};
+    Object.values(votes).forEach(c => tally[c] = (tally[c] || 0) + 1);
+    let res = `📊 *설문 결과*\n\n`;
+    for (const [c, count] of Object.entries(tally)) res += `• *${c}*: ${count}표\n`;
+    await client.chat.update({ 
+      channel: body.channel.id, 
+      ts: body.message.ts, 
+      blocks: [{ type: 'section', text: { type: 'mrkdwn', text: res } }], 
+      text: "설문 종료" 
+    });
+  } catch (e) { console.error("End Poll Error:", e); }
 });
 
-// --- Vercel 전용 핸들러 시작 ---
+// 3. Vercel용 핸들러 수동 내보내기
 module.exports = async (req, res) => {
-  // 슬랙은 POST 요청만 보냅니다.
+  // 슬랙은 POST로만 옵니다. GET 등으로 접속 시 서버 생존 확인용 응답
   if (req.method !== 'POST') {
-    return res.status(200).send('Slack Poll API is running!'); 
+    return res.status(200).send('Slack Poll API is active.');
   }
   
-  // Bolt의 핸들러 실행
+  // Bolt Receiver 실행
   return await receiver.requestHandler(req, res);
 };
 
-// Vercel이 바디 파싱을 하지 않도록 설정 (Bolt가 직접 파싱해야 함)
-export const config = {
+// Vercel 설정 - 바디 파서 비활성화 (매우 중요)
+module.exports.config = {
   api: {
     bodyParser: false,
   },
