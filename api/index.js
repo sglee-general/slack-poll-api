@@ -16,133 +16,132 @@ module.exports = async (req, res) => {
     body = querystring.parse(body.toString());
   }
 
-  // 1. 슬랙 챌린지 대응
   if (body.challenge) return res.status(200).send(body.challenge);
 
-  // 2. 명령어 (/설문) 처리
+  // 1. 명령어 (/설문) - 5개 입력칸 생성
   if (body.command === '/설문') {
     try {
-      // ★ 중요: 슬랙 API 호출을 먼저 완료할 때까지 기다립니다.
+      const optionBlocks = [1, 2, 3, 4, 5].map(num => ({
+        type: 'input',
+        block_id: `b${num}`,
+        optional: num > 2, // 1, 2번만 필수, 나머지는 선택
+        element: { type: 'plain_text_input', action_id: `i${num}` },
+        label: { type: 'plain_text', text: `선택지 ${num}` }
+      }));
+
       await client.views.open({
         trigger_id: body.trigger_id,
         view: {
           type: 'modal',
           callback_id: 'poll_modal',
           private_metadata: body.channel_id,
-          title: { type: 'plain_text', text: '📊 설문조사' },
+          title: { type: 'plain_text', text: '📊 설문조사 생성' },
           blocks: [
             { type: 'input', block_id: 'topic', element: { type: 'plain_text_input', action_id: 'i' }, label: { type: 'plain_text', text: '주제' } },
-            { type: 'input', block_id: 'b1', element: { type: 'plain_text_input', action_id: 'i1' }, label: { type: 'plain_text', text: '선택지 1' } },
-            { type: 'input', block_id: 'b2', element: { type: 'plain_text_input', action_id: 'i2' }, label: { type: 'plain_text', text: '선택지 2' } }
+            ...optionBlocks
           ],
           submit: { type: 'plain_text', text: '시작' }
         }
       });
-      
-      // API 호출이 성공한 "후에" 응답을 보냅니다.
-      return res.status(200).send(""); 
+      return res.status(200).send("");
     } catch (e) {
-      console.error("Slack API Error:", e);
-      return res.status(200).send("오류 발생: " + e.message);
+      return res.status(200).send("에러: " + e.message);
     }
   }
 
-  // 3. 인터랙션 처리
+  // 2. 인터랙션 처리
   if (body.payload) {
     const payload = JSON.parse(body.payload);
 
+    // [모달 제출] 5개 항목 중 입력된 것만 골라서 메시지 생성
     if (payload.type === 'view_submission') {
       try {
         const values = payload.view.state.values;
         const channelId = payload.view.private_metadata;
         const topic = values.topic.i.value;
-        const opt1 = values.b1.i1.value;
-        const opt2 = values.b2.i2.value;
-        const opt3 = values.b3.i3.value;
+        
+        // 1~5번까지 돌면서 값이 있는 것만 배열에 담기
+        const options = [];
+        for (let i = 1; i <= 5; i++) {
+          const val = values[`b${i}`][`i${i}`].value;
+          if (val && val.trim() !== "") options.push(val.trim());
+        }
 
-        // ★ 메시지 전송이 완료될 때까지 기다립니다.
+        const pollBlocks = [
+          { type: 'section', text: { type: 'mrkdwn', text: `🔔 *새로운 설문: ${topic}*` } },
+          { type: 'divider' }
+        ];
+
+        // 입력된 개수만큼 버튼 생성
+        options.forEach((opt, index) => {
+          pollBlocks.push({
+            type: 'section',
+            text: { type: 'mrkdwn', text: `*${index + 1}. ${opt}*` },
+            accessory: { 
+              type: 'button', 
+              text: { type: 'plain_text', text: '투표' }, 
+              value: opt, 
+              action_id: `v${index}` 
+            }
+          });
+        });
+
+        pollBlocks.push({ type: 'divider' });
+        pollBlocks.push({
+          type: 'actions',
+          elements: [{ type: 'button', text: { type: 'plain_text', text: '결과 보기 및 종료' }, style: 'danger', action_id: 'end' }]
+        });
+
         await client.chat.postMessage({
           channel: channelId,
-          text: `📊 *설문 시작: ${topic}*`,
-          blocks: [
-            { type: 'section', text: { type: 'mrkdwn', text: `*${topic}*` } },
-            { type: 'section', text: { type: 'mrkdwn', text: `1️⃣ ${opt1}` }, accessory: { type: 'button', text: { type: 'plain_text', text: '투표' }, value: opt1, action_id: 'v1' } },
-            { type: 'section', text: { type: 'mrkdwn', text: `2️⃣ ${opt2}` }, accessory: { type: 'button', text: { type: 'plain_text', text: '투표' }, value: opt2, action_id: 'v2' } },
-            { type: 'section', text: { type: 'mrkdwn', text: `2️⃣ ${opt3}` }, accessory: { type: 'button', text: { type: 'plain_text', text: '투표' }, value: opt3, action_id: 'v2' } },
-          ]
+          text: `📊 설문 시작: ${topic}`,
+          blocks: pollBlocks
         });
-        
-        // 메시지 전송 후 응답
-        return res.status(200).send("");
+
+        return res.status(200).json({ response_action: "clear" });
       } catch (e) {
-        console.error("Submission Error:", e);
+        console.error(e);
         return res.status(200).send();
       }
     }
-    
-    // 투표 버튼 처리
+
+    // [버튼 클릭 처리]
     if (payload.type === 'block_actions') {
       const action = payload.actions[0];
-      await redis.hset(`poll:${payload.message.ts}`, { [payload.user.id]: action.value });
-      return res.status(200).send("");
-    }
-  }
+      const messageTs = payload.message.ts;
+      const userId = payload.user.id;
 
-  res.status(200).send("");
-};
+      try {
+        if (action.action_id.startsWith('v')) {
+          await redis.hset(`poll:${messageTs}`, { [userId]: action.value });
+          await client.chat.postEphemeral({
+            channel: payload.channel.id,
+            user: userId,
+            text: `✅ *${action.value}* 에 투표 완료!`
+          });
+        }
 
-if (payload.type === 'block_actions') {
-  const action = payload.actions[0];
-  const userId = payload.user.id;
-  const channelId = payload.channel.id;
-  const messageTs = payload.message.ts;
-
-  try {
-    // 1. 투표 버튼 처리 (v1, v2 등)
-    if (action.action_id.startsWith('v')) {
-      // Redis에 저장
-      await redis.hset(`poll:${messageTs}`, { [userId]: action.value });
-
-      // 사용자에게만 보이는 투표 완료 메시지 전송
-      await client.chat.postEphemeral({
-        channel: channelId,
-        user: userId,
-        text: `✅ *${action.value}* 에 투표하셨습니다!`
-      });
-    }
-
-    // 2. 결과 보기 및 종료 버튼 (end) 처리
-    if (action.action_id === 'end') {
-      const votes = await redis.hgetall(`poll:${messageTs}`);
-      
-      if (!votes || Object.keys(votes).length === 0) {
-        await client.chat.postEphemeral({
-          channel: channelId,
-          user: userId,
-          text: "참여자가 없습니다."
-        });
+        if (action.action_id === 'end') {
+          const votes = await redis.hgetall(`poll:${messageTs}`);
+          if (votes) {
+            const tally = {};
+            Object.values(votes).forEach(v => tally[v] = (tally[v] || 0) + 1);
+            let resMsg = `📊 *최종 설문 결과*\n\n*주제: ${payload.message.blocks[0].text.text}*\n\n`;
+            for (const [o, c] of Object.entries(tally)) resMsg += `• *${o}*: ${c}표\n`;
+            
+            await client.chat.update({
+              channel: payload.channel.id,
+              ts: messageTs,
+              blocks: [{ type: 'section', text: { type: 'mrkdwn', text: resMsg } }],
+              text: "설문 종료"
+            });
+          }
+        }
+        return res.status(200).send("");
+      } catch (e) {
         return res.status(200).send();
       }
-
-      const tally = {};
-      Object.values(votes).forEach(v => tally[v] = (tally[v] || 0) + 1);
-      
-      let resMsg = `📊 *최종 설문 결과*\n\n`;
-      for (const [opt, count] of Object.entries(tally)) {
-        resMsg += `• *${opt}*: ${count}표\n`;
-      }
-
-      await client.chat.update({
-        channel: channelId,
-        ts: messageTs,
-        blocks: [{ type: 'section', text: { type: 'mrkdwn', text: resMsg } }],
-        text: "설문 종료"
-      });
     }
-
-    return res.status(200).send("");
-  } catch (e) {
-    console.error("Action Error:", e);
-    return res.status(200).send();
   }
-}
+  res.status(200).send("");
+};
