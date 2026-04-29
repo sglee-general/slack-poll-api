@@ -4,6 +4,7 @@
   "main": "api/index.js",
   "dependencies": {
     "@slack/bolt": "^3.21.0",
-    "@upstash/redis": "^1.34.0"
+    "@upstash/redis": "^1.34.0",
+    "raw-body": "^2.5.2"
   }
 }
