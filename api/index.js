@@ -165,3 +165,10 @@ module.exports = async (req, res) => {
     res.status(404).send('Not Found');
   }
 };
+
+// Vercel이 데이터를 미리 분석하지 않도록 설정 (Bolt가 직접 처리하게 함)
+module.exports.config = {
+  api: {
+    bodyParser: false,
+  },
+};
