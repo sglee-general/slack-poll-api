@@ -1,12 +1,20 @@
 const { App, ExpressReceiver } = require('@slack/bolt');
-const { Redis } = require('@upstash/redis');
+const Redis = require('ioredis');
 
-// 1. Redis 설정 (환경 변수에서 주소와 토큰을 가져옵니다)
-// Vercel KV가 제공하는 REST URL과 TOKEN을 사용해야 합니다.
-const redis = new Redis({
-  url: process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL,
-  token: process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN,
-});
+// 1. Redis 연결 설정을 변수로 관리 (타임아웃 방지 설정 추가)
+let redis;
+function getRedis() {
+  if (!redis) {
+    redis = new Redis(process.env.REDIS_URL, {
+      connectTimeout: 10000, // 연결 시도 시간을 10초로 늘림
+      maxRetriesPerRequest: 3,
+      retryStrategy(times) {
+        return Math.min(times * 50, 2000);
+      }
+    });
+  }
+  return redis;
+}
 
 const receiver = new ExpressReceiver({
   signingSecret: process.env.SLACK_SIGNING_SECRET,
@@ -55,7 +63,7 @@ app.command('/설문', async ({ ack, body, client }) => {
         submit: { type: 'plain_text', text: '설문 시작' }
       }
     });
-  } catch (e) { console.error(e); }
+  } catch (e) { console.error("Modal Error:", e); }
 });
 
 app.view('poll_modal', async ({ ack, body, view, client }) => {
@@ -91,31 +99,43 @@ app.view('poll_modal', async ({ ack, body, view, client }) => {
     elements: [{ type: 'button', text: { type: 'plain_text', text: '결과 보기 및 종료' }, style: 'danger', action_id: 'end_poll' }]
   });
 
-  await client.chat.postMessage({ channel: channelId, blocks, text: `설문 시작!` });
+  await client.chat.postMessage({ channel: channelId, blocks, text: `설문 시작: ${topic}` });
 });
 
+// 투표 저장 로직
 app.action(/^vote_/, async ({ ack, body, action }) => {
   await ack();
-  // Upstash 전용 hset 방식
-  await redis.hset(`poll:${body.message.ts}`, { [body.user.id]: action.value });
+  const r = getRedis();
+  await r.hset(`poll:${body.message.ts}`, body.user.id, action.value);
 });
 
+// 종료 처리 로직
 app.action('end_poll', async ({ ack, body, client }) => {
   await ack();
-  const votes = await redis.hgetall(`poll:${body.message.ts}`);
-  if (!votes) return;
+  const r = getRedis();
+  const votes = await r.hgetall(`poll:${body.message.ts}`);
+  if (!votes || Object.keys(votes).length === 0) return;
   
   const tally = {};
   Object.values(votes).forEach(c => tally[c] = (tally[c] || 0) + 1);
-  let res = `📊 *결과*\n\n`;
+  let res = `📊 *설문 종료 결과*\n\n`;
   for (const [c, count] of Object.entries(tally)) res += `• *${c}*: ${count}표\n`;
   
-  await client.chat.update({ channel: body.channel.id, ts: body.message.ts, blocks: [{ type: 'section', text: { type: 'mrkdwn', text: res } }], text: "종료" });
+  await client.chat.update({ 
+    channel: body.channel.id, 
+    ts: body.message.ts, 
+    blocks: [{ type: 'section', text: { type: 'mrkdwn', text: res } }], 
+    text: "설문 종료" 
+  });
 });
 
+/** 3. Vercel용 메인 핸들러 **/
 module.exports = async (req, res) => {
   if (req.body && req.body.challenge) return res.status(200).send(req.body.challenge);
-  if (req.method === 'POST') return await receiver.requestHandler(req, res);
+  
+  if (req.method === 'POST') {
+    return await receiver.requestHandler(req, res);
+  }
   res.status(200).send('API is Online');
 };
 
