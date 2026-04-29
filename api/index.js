@@ -75,29 +75,48 @@ module.exports = async (req, res) => {
     // 1. Slash Command
     // -----------------------------
     if (payload.command === '/설문') {
-      res.status(200).end(); // 🔥 ack
+      res.status(200).end(); // ack
 
-      await slackAPI('views.open', {
-        trigger_id: payload.trigger_id,
-        view: {
-          type: 'modal',
-          callback_id: 'poll_modal',
-          private_metadata: payload.channel_id,
-          title: { type: 'plain_text', text: '📊 설문 생성' },
-          submit: { type: 'plain_text', text: '시작' },
-          blocks: [
-            {
-              type: 'input',
-              block_id: 'topic',
-              element: {
-                type: 'plain_text_input',
-                action_id: 'topic_input',
-              },
-              label: { type: 'plain_text', text: '설문 주제' },
+      setTimeout(async () => {
+        try {
+          const optionBlocks = [1, 2, 3, 4, 5].map((n) => ({
+            type: 'input',
+            block_id: `opt_${n}`,
+            optional: n > 2,
+            element: {
+              type: 'plain_text_input',
+              action_id: `input_${n}`,
             },
-          ],
-        },
-      });
+            label: { type: 'plain_text', text: `선택지 ${n}` },
+          }));
+
+          await slackAPI('views.open', {
+            trigger_id: payload.trigger_id,
+            view: {
+              type: 'modal',
+              callback_id: 'poll_modal',
+              private_metadata: payload.channel_id,
+              title: { type: 'plain_text', text: '📊 설문 생성' },
+              submit: { type: 'plain_text', text: '설문 시작' },
+              blocks: [
+                {
+                  type: 'input',
+                  block_id: 'topic',
+                  element: {
+                    type: 'plain_text_input',
+                    action_id: 'topic_input',
+                  },
+                  label: { type: 'plain_text', text: '설문 주제' },
+                },
+                { type: 'divider' },
+                ...optionBlocks,
+              ],
+            },
+          });
+        } catch (e) {
+          console.error('views.open 에러:', e);
+        }
+      }, 0);
 
       return;
     }
@@ -108,15 +127,64 @@ module.exports = async (req, res) => {
     if (payload.type === 'view_submission') {
       res.status(200).end();
 
-      const topic = payload.view.state.values.topic.topic_input.value;
-      const channel = payload.view.private_metadata;
+      setTimeout(async () => {
+        try {
+          const channelId = payload.view.private_metadata;
+          const topic =
+            payload.view.state.values.topic.topic_input.value;
 
-      const result = await slackAPI('chat.postMessage', {
-        channel,
-        text: `📊 설문: ${topic}`,
-      });
+          const options = [];
+          for (let i = 1; i <= 5; i++) {
+            const val =
+              payload.view.state.values[`opt_${i}`][`input_${i}`].value;
+            if (val && val.trim()) options.push(val.trim());
+          }
 
-      await kv.hset(`poll:${result.ts}`, {});
+          const blocks = [
+            {
+              type: 'section',
+              text: { type: 'mrkdwn', text: `📊 *${topic}*` },
+            },
+            { type: 'divider' },
+          ];
+
+          options.forEach((opt, i) => {
+            blocks.push({
+              type: 'section',
+              text: { type: 'mrkdwn', text: `*${opt}*` },
+              accessory: {
+                type: 'button',
+                text: { type: 'plain_text', text: '투표' },
+                action_id: `vote_${i}`,
+                value: opt,
+              },
+            });
+          });
+
+          blocks.push({
+            type: 'actions',
+            elements: [
+              {
+                type: 'button',
+                text: { type: 'plain_text', text: '결과 보기 및 종료' },
+                style: 'danger',
+                action_id: 'end_poll',
+              },
+            ],
+          });
+
+          const result = await slackAPI('chat.postMessage', {
+            channel: channelId,
+            text: topic,
+            blocks,
+          });
+
+          await kv.hset(`poll:${result.ts}`, {});
+        } catch (e) {
+          console.error('poll 생성 에러:', e);
+        }
+      }, 0);
+
       return;
     }
 
@@ -126,35 +194,44 @@ module.exports = async (req, res) => {
     if (payload.type === 'block_actions') {
       res.status(200).end();
 
-      const action = payload.actions[0];
+      setTimeout(async () => {
+        try {
+          const action = payload.actions[0];
+          const key = `poll:${payload.message.ts}`;
 
-      // 투표
-      if (action.action_id.startsWith('vote_')) {
-        await kv.hset(`poll:${payload.message.ts}`, {
-          [payload.user.id]: action.value,
-        });
-      }
+          // 투표
+          if (action.action_id.startsWith('vote_')) {
+            await kv.hset(key, {
+              [payload.user.id]: action.value,
+            });
+          }
 
-      // 종료
-      if (action.action_id === 'end_poll') {
-        const votes = await kv.hgetall(`poll:${payload.message.ts}`);
-        const tally = {};
+          // 종료
+          if (action.action_id === 'end_poll') {
+            const votes = await kv.hgetall(key);
+            const tally = {};
 
-        Object.values(votes || {}).forEach((v) => {
-          tally[v] = (tally[v] || 0) + 1;
-        });
+            Object.values(votes || {}).forEach((v) => {
+              tally[v] = (tally[v] || 0) + 1;
+            });
 
-        let text = '📊 설문 결과\n\n';
-        for (const [k, v] of Object.entries(tally)) {
-          text += `• ${k}: ${v}표\n`;
+            let text = `📊 *설문 결과*\n\n`;
+            for (const [k, v] of Object.entries(tally)) {
+              text += `• *${k}*: ${v}표\n`;
+            }
+
+            await slackAPI('chat.update', {
+              channel: payload.channel.id,
+              ts: payload.message.ts,
+              text,
+            });
+
+            await kv.del(key);
+          }
+        } catch (e) {
+          console.error('action 에러:', e);
         }
-
-        await slackAPI('chat.update', {
-          channel: payload.channel.id,
-          ts: payload.message.ts,
-          text,
-        });
-      }
+      }, 0);
 
       return;
     }
