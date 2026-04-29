@@ -31,7 +31,11 @@ module.exports = async (req, res) => {
           blocks: [
             { type: 'input', block_id: 'topic', element: { type: 'plain_text_input', action_id: 'i' }, label: { type: 'plain_text', text: '주제' } },
             { type: 'input', block_id: 'b1', element: { type: 'plain_text_input', action_id: 'i1' }, label: { type: 'plain_text', text: '선택지 1' } },
-            { type: 'input', block_id: 'b2', element: { type: 'plain_text_input', action_id: 'i2' }, label: { type: 'plain_text', text: '선택지 2' } }
+            { type: 'input', block_id: 'b2', element: { type: 'plain_text_input', action_id: 'i2' }, label: { type: 'plain_text', text: '선택지 2' } },
+            { type: 'input', block_id: 'b3', element: { type: 'plain_text_input', action_id: 'i3' }, label: { type: 'plain_text', text: '선택지 3' } },
+            { type: 'input', block_id: 'b4', element: { type: 'plain_text_input', action_id: 'i4' }, label: { type: 'plain_text', text: '선택지 4' } },
+            { type: 'input', block_id: 'b5', element: { type: 'plain_text_input', action_id: 'i5' }, label: { type: 'plain_text', text: '선택지 5' } },
+            
           ],
           submit: { type: 'plain_text', text: '시작' }
         }
