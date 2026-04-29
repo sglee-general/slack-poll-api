@@ -9,30 +9,21 @@ const redis = new Redis({
 });
 
 module.exports = async (req, res) => {
-  // 1. 접속 로그 (Vercel 로그에서 확인 가능)
-  console.log("--- 새로운 요청 발생 ---");
-  console.log("메소드:", req.method);
-
   if (req.method !== 'POST') return res.status(200).send('API Online');
 
-  // 2. 데이터 파싱 (Vercel 환경에 맞게 수동 파싱)
   let body = req.body;
   if (typeof body === 'string' || Buffer.isBuffer(body)) {
     body = querystring.parse(body.toString());
   }
 
-  // 3. 슬랙 챌린지 대응
-  if (body.challenge) {
-    console.log("Challenge 요청 처리");
-    return res.status(200).send(body.challenge);
-  }
+  // 1. 슬랙 챌린지 대응
+  if (body.challenge) return res.status(200).send(body.challenge);
 
-  // 4. 명령어(/설문) 처리
+  // 2. 명령어 (/설문) 처리
   if (body.command === '/설문') {
-    console.log("명령어 인식됨: /설문");
-    
     try {
-      const result = await client.views.open({
+      // ★ 중요: 슬랙 API 호출을 먼저 완료할 때까지 기다립니다.
+      await client.views.open({
         trigger_id: body.trigger_id,
         view: {
           type: 'modal',
@@ -47,38 +38,53 @@ module.exports = async (req, res) => {
           submit: { type: 'plain_text', text: '시작' }
         }
       });
-      console.log("모달 전송 성공");
-      return res.status(200).send(""); // 성공 응답
+      
+      // API 호출이 성공한 "후에" 응답을 보냅니다.
+      return res.status(200).send(""); 
     } catch (e) {
-      console.error("모달 전송 실패 에러:", e.data ? JSON.stringify(e.data) : e.message);
-      return res.status(200).send("에러가 발생했습니다: " + e.message);
+      console.error("Slack API Error:", e);
+      return res.status(200).send("오류 발생: " + e.message);
     }
   }
 
-  // 5. 인터랙션 (확인 버튼 등) 처리
+  // 3. 인터랙션 처리
   if (body.payload) {
     const payload = JSON.parse(body.payload);
-    console.log("인터랙션 타입:", payload.type);
 
     if (payload.type === 'view_submission') {
-      const channelId = payload.view.private_metadata;
-      const topic = payload.view.state.values.topic.i.value;
-      const opt1 = payload.view.state.values.b1.i1.value;
-      const opt2 = payload.view.state.values.b2.i2.value;
+      try {
+        const values = payload.view.state.values;
+        const channelId = payload.view.private_metadata;
+        const topic = values.topic.i.value;
+        const opt1 = values.b1.i1.value;
+        const opt2 = values.b2.i2.value;
 
-      await client.chat.postMessage({
-        channel: channelId,
-        text: `📊 *설문 시작: ${topic}*`,
-        blocks: [
-          { type: 'section', text: { type: 'mrkdwn', text: `*${topic}*` } },
-          { type: 'section', text: { type: 'mrkdwn', text: `1️⃣ ${opt1}` }, accessory: { type: 'button', text: { type: 'plain_text', text: '투표' }, value: opt1, action_id: 'v1' } },
-          { type: 'section', text: { type: 'mrkdwn', text: `2️⃣ ${opt2}` }, accessory: { type: 'button', text: { type: 'plain_text', text: '투표' }, value: opt2, action_id: 'v2' } }
-        ]
-      });
+        // ★ 메시지 전송이 완료될 때까지 기다립니다.
+        await client.chat.postMessage({
+          channel: channelId,
+          text: `📊 *설문 시작: ${topic}*`,
+          blocks: [
+            { type: 'section', text: { type: 'mrkdwn', text: `*${topic}*` } },
+            { type: 'section', text: { type: 'mrkdwn', text: `1️⃣ ${opt1}` }, accessory: { type: 'button', text: { type: 'plain_text', text: '투표' }, value: opt1, action_id: 'v1' } },
+            { type: 'section', text: { type: 'mrkdwn', text: `2️⃣ ${opt2}` }, accessory: { type: 'button', text: { type: 'plain_text', text: '투표' }, value: opt2, action_id: 'v2' } }
+          ]
+        });
+        
+        // 메시지 전송 후 응답
+        return res.status(200).send("");
+      } catch (e) {
+        console.error("Submission Error:", e);
+        return res.status(200).send();
+      }
+    }
+    
+    // 투표 버튼 처리
+    if (payload.type === 'block_actions') {
+      const action = payload.actions[0];
+      await redis.hset(`poll:${payload.message.ts}`, { [payload.user.id]: action.value });
       return res.status(200).send("");
     }
   }
 
-  console.log("처리되지 않은 요청");
   res.status(200).send("");
 };
