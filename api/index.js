@@ -58,6 +58,7 @@ module.exports = async (req, res) => {
         const topic = values.topic.i.value;
         const opt1 = values.b1.i1.value;
         const opt2 = values.b2.i2.value;
+        const opt3 = values.b3.i3.value;
 
         // ★ 메시지 전송이 완료될 때까지 기다립니다.
         await client.chat.postMessage({
@@ -66,7 +67,8 @@ module.exports = async (req, res) => {
           blocks: [
             { type: 'section', text: { type: 'mrkdwn', text: `*${topic}*` } },
             { type: 'section', text: { type: 'mrkdwn', text: `1️⃣ ${opt1}` }, accessory: { type: 'button', text: { type: 'plain_text', text: '투표' }, value: opt1, action_id: 'v1' } },
-            { type: 'section', text: { type: 'mrkdwn', text: `2️⃣ ${opt2}` }, accessory: { type: 'button', text: { type: 'plain_text', text: '투표' }, value: opt2, action_id: 'v2' } }
+            { type: 'section', text: { type: 'mrkdwn', text: `2️⃣ ${opt2}` }, accessory: { type: 'button', text: { type: 'plain_text', text: '투표' }, value: opt2, action_id: 'v2' } },
+            { type: 'section', text: { type: 'mrkdwn', text: `2️⃣ ${opt3}` }, accessory: { type: 'button', text: { type: 'plain_text', text: '투표' }, value: opt3, action_id: 'v2' } },
           ]
         });
         
@@ -88,3 +90,59 @@ module.exports = async (req, res) => {
 
   res.status(200).send("");
 };
+
+if (payload.type === 'block_actions') {
+  const action = payload.actions[0];
+  const userId = payload.user.id;
+  const channelId = payload.channel.id;
+  const messageTs = payload.message.ts;
+
+  try {
+    // 1. 투표 버튼 처리 (v1, v2 등)
+    if (action.action_id.startsWith('v')) {
+      // Redis에 저장
+      await redis.hset(`poll:${messageTs}`, { [userId]: action.value });
+
+      // 사용자에게만 보이는 투표 완료 메시지 전송
+      await client.chat.postEphemeral({
+        channel: channelId,
+        user: userId,
+        text: `✅ *${action.value}* 에 투표하셨습니다!`
+      });
+    }
+
+    // 2. 결과 보기 및 종료 버튼 (end) 처리
+    if (action.action_id === 'end') {
+      const votes = await redis.hgetall(`poll:${messageTs}`);
+      
+      if (!votes || Object.keys(votes).length === 0) {
+        await client.chat.postEphemeral({
+          channel: channelId,
+          user: userId,
+          text: "참여자가 없습니다."
+        });
+        return res.status(200).send();
+      }
+
+      const tally = {};
+      Object.values(votes).forEach(v => tally[v] = (tally[v] || 0) + 1);
+      
+      let resMsg = `📊 *최종 설문 결과*\n\n`;
+      for (const [opt, count] of Object.entries(tally)) {
+        resMsg += `• *${opt}*: ${count}표\n`;
+      }
+
+      await client.chat.update({
+        channel: channelId,
+        ts: messageTs,
+        blocks: [{ type: 'section', text: { type: 'mrkdwn', text: resMsg } }],
+        text: "설문 종료"
+      });
+    }
+
+    return res.status(200).send("");
+  } catch (e) {
+    console.error("Action Error:", e);
+    return res.status(200).send();
+  }
+}
