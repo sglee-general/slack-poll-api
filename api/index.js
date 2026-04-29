@@ -1,13 +1,9 @@
 const { App, ExpressReceiver } = require('@slack/bolt');
-const { Redis } = require('@upstash/redis');
+const Redis = require('ioredis'); // ioredis로 변경
 
-// 1. Redis 설정 (Vercel KV 연동 시 자동으로 들어오는 환경변수 사용)
-const redis = new Redis({
-  url: process.env.KV_REST_API_URL,
-  token: process.env.KV_REST_API_TOKEN,
-});
+// 환경 변수에 있는 REDIS_URL을 사용하여 바로 연결합니다.
+const redis = new Redis(process.env.REDIS_URL);
 
-// 2. 슬랙 Receiver 설정
 const receiver = new ExpressReceiver({
   signingSecret: process.env.SLACK_SIGNING_SECRET,
   processBeforeResponse: true,
@@ -18,11 +14,10 @@ const app = new App({
   receiver,
 });
 
-/** [핵심 로직: /설문 명령어] **/
+/** [이하 로직 부분 - 데이터 저장 방식만 살짝 수정] **/
+
 app.command('/설문', async ({ ack, body, client }) => {
-  // 슬랙은 3초 안에 ack()를 받아야 합니다.
   await ack();
-  
   try {
     const optionBlocks = [1, 2, 3, 4, 5].map(num => ({
       type: 'input',
@@ -56,12 +51,9 @@ app.command('/설문', async ({ ack, body, client }) => {
         submit: { type: 'plain_text', text: '설문 시작' }
       }
     });
-  } catch (error) {
-    console.error("Modal Error:", error);
-  }
+  } catch (e) { console.error(e); }
 });
 
-/** [로직: 모달 제출, 투표, 종료 등은 이전과 동일하게 작동하도록 구성] **/
 app.view('poll_modal', async ({ ack, body, view, client }) => {
   await ack();
   const channelId = view.private_metadata;
@@ -95,48 +87,37 @@ app.view('poll_modal', async ({ ack, body, view, client }) => {
     elements: [{ type: 'button', text: { type: 'plain_text', text: '결과 보기 및 종료' }, style: 'danger', action_id: 'end_poll' }]
   });
 
-  await client.chat.postMessage({ channel: channelId, blocks, text: `설문 시작!` });
+  await client.chat.postMessage({ channel: channelId, blocks, text: `설문 시작: ${topic}` });
 });
 
 app.action(/^vote_/, async ({ ack, body, action }) => {
   await ack();
-  // hset 사용 (Upstash Redis 방식)
-  await redis.hset(`poll:${body.message.ts}`, { [body.user.id]: action.value });
+  // ioredis 방식의 저장
+  await redis.hset(`poll:${body.message.ts}`, body.user.id, action.value);
 });
 
 app.action('end_poll', async ({ ack, body, client }) => {
   await ack();
   const votes = await redis.hgetall(`poll:${body.message.ts}`);
-  if (!votes) return;
+  if (!votes || Object.keys(votes).length === 0) return;
+  
   const tally = {};
   Object.values(votes).forEach(c => tally[c] = (tally[c] || 0) + 1);
-  let res = `📊 *설문 결과*\n\n`;
+  let res = `📊 *설문 종료 결과*\n\n`;
   for (const [c, count] of Object.entries(tally)) res += `• *${c}*: ${count}표\n`;
-  await client.chat.update({ channel: body.channel.id, ts: body.message.ts, blocks: [{ type: 'section', text: { type: 'mrkdwn', text: res } }], text: "종료" });
+  
+  await client.chat.update({ 
+    channel: body.channel.id, 
+    ts: body.message.ts, 
+    blocks: [{ type: 'section', text: { type: 'mrkdwn', text: res } }], 
+    text: "설문 종료" 
+  });
 });
 
-/** 3. Vercel용 통합 핸들러 (404 방지) **/
 module.exports = async (req, res) => {
-  // 1. GET 요청 대응 (브라우저에서 주소 쳤을 때 작동 확인용)
-  if (req.method === 'GET') {
-    return res.status(200).send('슬랙 설문 API가 정상 작동 중입니다!');
-  }
-
-  // 2. 슬랙 URL 인증(Challenge) 처리
-  if (req.body && req.body.challenge) {
-    return res.status(200).send(req.body.challenge);
-  }
-
-  // 3. 슬랙 이벤트 처리
-  try {
-    await receiver.requestHandler(req, res);
-  } catch (error) {
-    console.error("API Error:", error);
-    res.status(500).end();
-  }
+  if (req.body && req.body.challenge) return res.status(200).send(req.body.challenge);
+  if (req.method === 'POST') return await receiver.requestHandler(req, res);
+  res.status(200).send('API is Online');
 };
 
-// Vercel 설정
-module.exports.config = {
-  api: { bodyParser: false },
-};
+module.exports.config = { api: { bodyParser: false } };
