@@ -1,8 +1,12 @@
 const { App, ExpressReceiver } = require('@slack/bolt');
-const Redis = require('ioredis'); // ioredis로 변경
+const { Redis } = require('@upstash/redis');
 
-// 환경 변수에 있는 REDIS_URL을 사용하여 바로 연결합니다.
-const redis = new Redis(process.env.REDIS_URL);
+// 1. Redis 설정 (환경 변수에서 주소와 토큰을 가져옵니다)
+// Vercel KV가 제공하는 REST URL과 TOKEN을 사용해야 합니다.
+const redis = new Redis({
+  url: process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL,
+  token: process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN,
+});
 
 const receiver = new ExpressReceiver({
   signingSecret: process.env.SLACK_SIGNING_SECRET,
@@ -14,7 +18,7 @@ const app = new App({
   receiver,
 });
 
-/** [이하 로직 부분 - 데이터 저장 방식만 살짝 수정] **/
+/** [로직 부분] **/
 
 app.command('/설문', async ({ ack, body, client }) => {
   await ack();
@@ -87,31 +91,26 @@ app.view('poll_modal', async ({ ack, body, view, client }) => {
     elements: [{ type: 'button', text: { type: 'plain_text', text: '결과 보기 및 종료' }, style: 'danger', action_id: 'end_poll' }]
   });
 
-  await client.chat.postMessage({ channel: channelId, blocks, text: `설문 시작: ${topic}` });
+  await client.chat.postMessage({ channel: channelId, blocks, text: `설문 시작!` });
 });
 
 app.action(/^vote_/, async ({ ack, body, action }) => {
   await ack();
-  // ioredis 방식의 저장
-  await redis.hset(`poll:${body.message.ts}`, body.user.id, action.value);
+  // Upstash 전용 hset 방식
+  await redis.hset(`poll:${body.message.ts}`, { [body.user.id]: action.value });
 });
 
 app.action('end_poll', async ({ ack, body, client }) => {
   await ack();
   const votes = await redis.hgetall(`poll:${body.message.ts}`);
-  if (!votes || Object.keys(votes).length === 0) return;
+  if (!votes) return;
   
   const tally = {};
   Object.values(votes).forEach(c => tally[c] = (tally[c] || 0) + 1);
-  let res = `📊 *설문 종료 결과*\n\n`;
+  let res = `📊 *결과*\n\n`;
   for (const [c, count] of Object.entries(tally)) res += `• *${c}*: ${count}표\n`;
   
-  await client.chat.update({ 
-    channel: body.channel.id, 
-    ts: body.message.ts, 
-    blocks: [{ type: 'section', text: { type: 'mrkdwn', text: res } }], 
-    text: "설문 종료" 
-  });
+  await client.chat.update({ channel: body.channel.id, ts: body.message.ts, blocks: [{ type: 'section', text: { type: 'mrkdwn', text: res } }], text: "종료" });
 });
 
 module.exports = async (req, res) => {
